@@ -75,11 +75,11 @@ jobs:
             if [ "$QUALITY" = "audio" ]; then
               yt-dlp -v $COOKIE_ARGS --remote-components ejs:github \
                 -f "$FMT" -x --audio-format mp3 \
-                -o "%(title)s.%(ext)s" "$URL"
+                -o "%(title).80s.%(ext)s" "$URL"
             else
               yt-dlp -v $COOKIE_ARGS --remote-components ejs:github \
                 -f "$FMT" --merge-output-format mp4 \
-                -o "%(title)s.%(ext)s" "$URL"
+                -o "%(title).80s.%(ext)s" "$URL"
             fi
             STATUS=$?
             rm -f /tmp/cookies.txt
