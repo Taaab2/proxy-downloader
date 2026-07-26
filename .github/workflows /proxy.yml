@@ -1,0 +1,125 @@
+name: Proxy Downloader
+
+run-name: dl-${{ github.event.client_payload.request_id }}
+
+on:
+  repository_dispatch:
+    types: [download]
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Deno
+        if: github.event.client_payload.mode == 'video'
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Ensure ffmpeg is available
+        if: github.event.client_payload.mode == 'video'
+        run: |
+          if ! command -v ffmpeg &> /dev/null; then
+            sudo apt-get update -y
+            sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+
+      - name: Install yt-dlp
+        if: github.event.client_payload.mode == 'video'
+        run: pip install -U "yt-dlp[default]" bgutil-ytdlp-pot-provider
+
+      - name: Start PO Token Provider (avoids needing YouTube cookies)
+        if: github.event.client_payload.mode == 'video'
+        run: |
+          docker run --name bgutil-provider -d --init -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
+          sleep 5
+          docker logs bgutil-provider || true
+
+      - name: Download File (video / regular file)
+        env:
+          SITE_COOKIES: ${{ secrets.YT_COOKIES }}
+          QUALITY: ${{ github.event.client_payload.quality }}
+          MODE: ${{ github.event.client_payload.mode }}
+        run: |
+          URL="${{ github.event.client_payload.url }}"
+          QUALITY="${QUALITY:-best}"
+          MODE="${MODE:-file}"
+          echo "Downloading: $URL (mode: $MODE, quality: $QUALITY)"
+          mkdir -p out
+          cd out
+
+          if [ "$MODE" = "video" ]; then
+            case "$QUALITY" in
+              1080) FMT='bv*[height<=1080]+ba/b[height<=1080]' ;;
+              720)  FMT='bv*[height<=720]+ba/b[height<=720]' ;;
+              480)  FMT='bv*[height<=480]+ba/b[height<=480]' ;;
+              audio) FMT='ba' ;;
+              *) FMT='bv*+ba/b' ;;
+            esac
+
+            COOKIE_ARGS=""
+            if [ -n "$SITE_COOKIES" ]; then
+              echo "$SITE_COOKIES" > /tmp/cookies.txt
+              COOKIE_ARGS="--cookies /tmp/cookies.txt"
+            fi
+
+            if [ "$QUALITY" = "audio" ]; then
+              yt-dlp -v $COOKIE_ARGS --remote-components ejs:github \
+                -f "$FMT" -x --audio-format mp3 \
+                -o "%(title)s.%(ext)s" "$URL"
+            else
+              yt-dlp -v $COOKIE_ARGS --remote-components ejs:github \
+                -f "$FMT" --merge-output-format mp4 \
+                -o "%(title)s.%(ext)s" "$URL"
+            fi
+            STATUS=$?
+            rm -f /tmp/cookies.txt
+
+            if [ $STATUS -ne 0 ]; then
+              echo "::error::yt-dlp failed with exit code $STATUS"
+              exit $STATUS
+            fi
+
+          else
+            FILENAME=$(basename "$URL" | cut -d'?' -f1)
+            if [ -z "$FILENAME" ] || [ "$FILENAME" = "/" ]; then
+              FILENAME="downloaded_file"
+            fi
+
+            HTTP_CODE=$(curl -L -w "%{http_code}" -o "$FILENAME" \
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+              "$URL")
+
+            echo "HTTP status: $HTTP_CODE"
+            if [ "$HTTP_CODE" -ge 400 ]; then
+              echo "::error::Download failed with HTTP $HTTP_CODE"
+              head -c 500 "$FILENAME"
+              exit 1
+            fi
+          fi
+
+          ls -la .
+
+          RAW_NAME=$(ls -1 . | head -n 1)
+          SAFE_NAME=$(echo "$RAW_NAME" | sed 's/[":<>|*?\\/]/_/g' | cut -c1-150)
+          if [ -z "$SAFE_NAME" ]; then
+            SAFE_NAME="downloaded-file"
+          fi
+          echo "ARTIFACT_NAME=$SAFE_NAME" >> "$GITHUB_ENV"
+          echo "Artifact will be named: $SAFE_NAME"
+
+      - name: Upload Artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: out/
