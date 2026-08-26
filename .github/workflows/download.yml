@@ -1,0 +1,504 @@
+name: download
+run-name: dl-${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: 'Unique download id (used for run-name + artifact name)'
+        required: true
+        type: string
+      url:
+        description: 'Video / page URL'
+        required: true
+        type: string
+      quality:
+        description: 'best | 1080 | 720 | 480 | audio'
+        required: false
+        default: 'best'
+        type: string
+      mode:
+        description: 'video (single item) | collection (whole channel/playlist, zipped)'
+        required: false
+        default: 'video'
+        type: string
+      cookies_enc:
+        description: 'AES-256-GCM encrypted cookies.txt, base64 (iv|ct|tag). Leave empty for none.'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dl-${{ inputs.request_id }}
+  cancel-in-progress: false
+
+jobs:
+  # ------------------------------------------------------------- single video/audio
+  resolve-video:
+    if: inputs.mode != 'collection'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate request id
+        run: |
+          case "${{ inputs.request_id }}" in
+            *[!a-zA-Z0-9-]*|"") echo "::error::request_id must be [a-zA-Z0-9-] only"; exit 1;;
+          esac
+
+      # yt-dlp needs a JS runtime (Deno) plus the actual challenge-solver script to
+      # pass YouTube's "n" parameter check. Deno alone isn't enough — without also
+      # passing --remote-components ejs:github (below, on the real yt-dlp calls),
+      # yt-dlp skips the solver and every video fails with "The page needs to be
+      # reloaded", found live: https://github.com/yt-dlp/yt-dlp/wiki/EJS
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # ffmpeg used to come from apt, which meant an apt-get update plus resolving
+      # and unpacking ~15 transitive codec libraries (libva2, libvpl2, ...) every
+      # single run — ~30s measured live, the actual bottleneck, not GitHub finding
+      # the run. imageio-ffmpeg ships a static ffmpeg binary as a normal pip wheel
+      # (one download from PyPI, no apt at all), cutting that to a few seconds.
+      - name: Install yt-dlp + ffmpeg
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet --upgrade yt-dlp cryptography imageio-ffmpeg curl_cffi
+          if command -v zip >/dev/null 2>&1; then
+            : # already on the runner image, no apt needed
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq zip
+          fi
+          if command -v ffmpeg >/dev/null 2>&1; then
+            FFMPEG_BIN=$(command -v ffmpeg)
+          else
+            FFMPEG_BIN=$(python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())")
+            chmod +x "$FFMPEG_BIN"
+          fi
+          echo "FFMPEG_BIN=$FFMPEG_BIN" >> "$GITHUB_ENV"
+          yt-dlp --version
+          "$FFMPEG_BIN" -version | head -1
+
+      - name: Decrypt cookies
+        if: ${{ inputs.cookies_enc != '' }}
+        env:
+          COOKIES_ENC: ${{ inputs.cookies_enc }}
+          COOKIE_KEY: ${{ secrets.COOKIE_KEY }}
+        run: |
+          if [ -z "$COOKIE_KEY" ]; then
+            echo "::error::repository secret COOKIE_KEY is missing"
+            exit 1
+          fi
+          python - <<'PY'
+          import base64, os, sys
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          blob = base64.b64decode(os.environ["COOKIES_ENC"])
+          key = bytes.fromhex(os.environ["COOKIE_KEY"].strip())
+          iv, ct = blob[:12], blob[12:]
+          try:
+              data = AESGCM(key).decrypt(iv, ct, None)
+          except Exception:
+              print("::error::cookie decryption failed - COOKIE_KEY in the extension and in the repo secret do not match")
+              sys.exit(1)
+          with open("cookies.txt", "wb") as f:
+              f.write(data)
+          print(f"cookies.txt written ({len(data)} bytes)")
+          PY
+
+      - name: Download
+        env:
+          TARGET_URL: ${{ inputs.url }}
+          QUALITY: ${{ inputs.quality }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+        run: |
+          mkdir -p out
+          case "$QUALITY" in
+            audio) FMT_ARGS="-f bestaudio/best -x --audio-format mp3 --audio-quality 0" ;;
+            1080)  FMT_ARGS="-f bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b --merge-output-format mp4" ;;
+            720)   FMT_ARGS="-f bv*[height<=720]+ba/b[height<=720]/bv*+ba/b --merge-output-format mp4" ;;
+            480)   FMT_ARGS="-f bv*[height<=480]+ba/b[height<=480]/bv*+ba/b --merge-output-format mp4" ;;
+            *)     FMT_ARGS="-f bv*+ba/b --merge-output-format mp4" ;;
+          esac
+
+          COOKIE_ARGS=""
+          if [ -f cookies.txt ]; then COOKIE_ARGS="--cookies cookies.txt"; fi
+          # Optional: set a repo secret PROXY_URL to route through a residential IP,
+          # which is the only thing that clears sites that block GitHub's datacenter IP
+          # (e.g. Cloudflare "Just a moment" that even a real browser can't pass here).
+          PROXY_ARGS=""
+          if [ -n "$PROXY_URL" ]; then PROXY_ARGS="--proxy $PROXY_URL"; fi
+
+          run_ytdlp() {
+            yt-dlp \
+              $FMT_ARGS $PROXY_ARGS "$@" \
+              --no-playlist --no-progress --newline \
+              --retries 5 --fragment-retries 10 \
+              --embed-metadata \
+              --remote-components ejs:github \
+              --ffmpeg-location "$FFMPEG_BIN" \
+              -o "out/%(title).120B [%(id)s].%(ext)s" \
+              -- "$TARGET_URL"
+          }
+
+          # Retry ladder so a download succeeds in as many cases as possible:
+          #  - alternate youtube player clients (helps youtube without cookies; a no-op
+          #    on other sites since yt-dlp only applies youtube extractor-args to youtube)
+          #  - --impersonate: curl_cffi mimics a real browser's TLS fingerprint, which
+          #    clears Cloudflare "anti-bot" 403s that block many news/video sites
+          #  - a final rung with no cookies at all, in case stale cookies were the cause
+          IMP="generic:impersonate"
+          ALT="youtube:player_client=default,tv,web_safari,mweb,tv_embedded"
+          if run_ytdlp $COOKIE_ARGS --extractor-args "$IMP"; then :
+          elif run_ytdlp $COOKIE_ARGS --extractor-args "$ALT"; then :
+          elif run_ytdlp $COOKIE_ARGS --impersonate chrome; then :
+          elif run_ytdlp --extractor-args "$IMP" --extractor-args "$ALT"; then :
+          else
+            echo "::error::download failed for this URL (the site may require being signed in, or blocks automated downloads)"
+            rm -f cookies.txt
+            exit 1
+          fi
+
+          rm -f cookies.txt
+          ls -la out
+
+      - name: Always drop cookies
+        if: always()
+        run: rm -f cookies.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dl-${{ inputs.request_id }}
+          path: out/
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
+
+  # ------------------------------------------------- collection: list what's in it
+  # A separate job because a matrix's item list has to be known before that matrix's
+  # jobs are scheduled — this can't be computed inside the same job that uses it.
+  # --flat-playlist only reads the listing page, no per-item extraction, so this is
+  # fast and doesn't need Deno/ffmpeg/challenge-solving at all.
+  enumerate:
+    if: inputs.mode == 'collection'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      items: ${{ steps.list.outputs.items }}
+      collection_name: ${{ steps.list.outputs.name }}
+      item_count: ${{ steps.list.outputs.count }}
+    steps:
+      - name: Validate request id
+        run: |
+          case "${{ inputs.request_id }}" in
+            *[!a-zA-Z0-9-]*|"") echo "::error::request_id must be [a-zA-Z0-9-] only"; exit 1;;
+          esac
+
+      - name: List collection items
+        id: list
+        env:
+          TARGET_URL: ${{ inputs.url }}
+          COOKIES_ENC: ${{ inputs.cookies_enc }}
+          COOKIE_KEY: ${{ secrets.COOKIE_KEY }}
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet --upgrade yt-dlp cryptography
+          python - <<'PY'
+          import base64, json, os, re, secrets, sys
+          from urllib.parse import urlsplit, urlunsplit
+
+          import yt_dlp
+
+          TARGET_URL = os.environ["TARGET_URL"]
+          MAX_ITEMS = 200
+
+          cookies_path = None
+          cookies_enc = os.environ.get("COOKIES_ENC", "")
+          cookie_key = os.environ.get("COOKIE_KEY", "")
+          if cookies_enc and cookie_key:
+              from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+              blob = base64.b64decode(cookies_enc)
+              key = bytes.fromhex(cookie_key.strip())
+              iv, ct = blob[:12], blob[12:]
+              try:
+                  data = AESGCM(key).decrypt(iv, ct, None)
+              except Exception:
+                  print("::error::cookie decryption failed - COOKIE_KEY in the extension and in the repo secret do not match")
+                  sys.exit(1)
+              with open("cookies.txt", "wb") as f:
+                  f.write(data)
+              cookies_path = "cookies.txt"
+
+          def safe_name(name, limit=120):
+              name = (name or "").strip()
+              if not name or name == "NA":
+                  return None
+              cleaned = re.sub(r'[ /\\:*?"<>|]+', "_", name)
+              return cleaned[:limit] or None
+
+          def resolve_url(entry):
+              u = entry.get("url") or entry.get("webpage_url")
+              if not u:
+                  return None
+              if u.startswith("http://") or u.startswith("https://"):
+                  return u
+              return f"https://www.youtube.com/watch?v={u}"
+
+          ydl_opts = {
+              "extract_flat": True,
+              "quiet": True,
+              "no_warnings": True,
+              "skip_download": True,
+              "playlistend": MAX_ITEMS,  # bounds each individual listing call too, not just the total
+          }
+          if cookies_path:
+              ydl_opts["cookiefile"] = cookies_path
+
+          def flat_list(url):
+              with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                  return ydl.extract_info(url, download=False)
+
+          info = flat_list(TARGET_URL)
+          collection_name = (
+              safe_name(info.get("title") or info.get("playlist_title") or info.get("channel") or info.get("uploader"))
+              or "collection"
+          )
+
+          items = []
+          host = urlsplit(TARGET_URL).netloc.removeprefix("www.").removeprefix("m.")
+          is_youtube = host in ("youtube.com", "music.youtube.com")
+          # The "list its Playlists tab" trick below is YouTube's own URL scheme
+          # (.../playlists) — only try it there. Any other site, or a YouTube URL
+          # that's already a specific playlist (?list=...), gets the flat listing.
+          is_single_playlist = (not is_youtube) or "list=" in TARGET_URL
+
+          def add_entries(entries, album):
+              for e in entries or []:
+                  if not e or len(items) >= MAX_ITEMS:
+                      continue
+                  vid = e.get("id")
+                  url = resolve_url(e)
+                  if vid and url:
+                      items.append({"id": vid, "url": url, "album": album})
+
+          if is_single_playlist:
+              # A specific playlist (or a non-YouTube site) — one flat level, no album split.
+              add_entries(info.get("entries"), "")
+          else:
+              # A channel: list its Playlists tab first, so the zip can mirror how the
+              # channel organizes itself (albums, live sets, ...) instead of one flat
+              # dump. Falls back to the plain video list if it has no playlists.
+              parts = urlsplit(TARGET_URL)
+              segs = [s for s in parts.path.split("/") if s]
+              if segs and segs[0] in ("channel", "c", "user") and len(segs) >= 2:
+                  base = "/" + "/".join(segs[:2])
+              elif segs and segs[0].startswith("@"):
+                  base = "/" + segs[0]
+              else:
+                  base = "/" + segs[0] if segs else ""
+              netloc = parts.netloc or "www.youtube.com"
+              playlists_url = urlunsplit((parts.scheme or "https", netloc, base.rstrip("/") + "/playlists", "", ""))
+
+              playlists = []
+              try:
+                  pl_info = flat_list(playlists_url)
+                  for e in pl_info.get("entries") or []:
+                      if e and e.get("id"):
+                          playlists.append({"id": e["id"], "title": e.get("title") or e["id"]})
+              except Exception:
+                  playlists = []
+
+              if playlists:
+                  for pl in playlists:
+                      if len(items) >= MAX_ITEMS:
+                          break
+                      album = safe_name(pl["title"], limit=80) or pl["id"]
+                      try:
+                          pl_videos = flat_list(f"https://www.youtube.com/playlist?list={pl['id']}")
+                      except Exception:
+                          continue
+                      add_entries(pl_videos.get("entries"), album)
+              else:
+                  add_entries(info.get("entries"), "")
+
+          if os.path.exists("cookies.txt"):
+              os.remove("cookies.txt")
+
+          if not items:
+              print("::error::this channel or playlist has no public videos to download (it may be empty, or its content needs sign-in)")
+              sys.exit(1)
+
+          if len(items) >= MAX_ITEMS:
+              print(f"::notice::stopping at {MAX_ITEMS} items — this collection may have more")
+
+          album_count = len({i["album"] for i in items if i["album"]})
+          print(f"collection: {collection_name} ({len(items)} items, {album_count} albums)")
+
+          delim = f"ghadelim_{secrets.token_hex(8)}"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"items<<{delim}\n{json.dumps(items)}\n{delim}\n")
+              f.write(f"name={collection_name}\n")
+              f.write(f"count={len(items)}\n")
+          PY
+
+  # --------------------------------------------- collection: one job per item
+  # This is also what gives the extension real "X of Y downloaded" progress: GitHub's
+  # API exposes each matrix job's status individually, unlike a single step's internal
+  # progress (which isn't visible from outside while the job is still running).
+  download-item:
+    if: inputs.mode == 'collection'
+    needs: enumerate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true # one bad video shouldn't fail the whole collection
+    strategy:
+      fail-fast: false
+      max-parallel: 16 # GitHub's own account-wide concurrent-job ceiling is the real cap
+      matrix:
+        video: ${{ fromJson(needs.enumerate.outputs.items) }}
+    name: download-item ${{ matrix.video.id }}
+    steps:
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install yt-dlp + ffmpeg
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet --upgrade yt-dlp cryptography imageio-ffmpeg curl_cffi
+          if command -v ffmpeg >/dev/null 2>&1; then
+            FFMPEG_BIN=$(command -v ffmpeg)
+          else
+            FFMPEG_BIN=$(python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())")
+            chmod +x "$FFMPEG_BIN"
+          fi
+          echo "FFMPEG_BIN=$FFMPEG_BIN" >> "$GITHUB_ENV"
+
+      - name: Decrypt cookies
+        if: ${{ inputs.cookies_enc != '' }}
+        env:
+          COOKIES_ENC: ${{ inputs.cookies_enc }}
+          COOKIE_KEY: ${{ secrets.COOKIE_KEY }}
+        run: |
+          if [ -z "$COOKIE_KEY" ]; then
+            echo "::error::repository secret COOKIE_KEY is missing"
+            exit 1
+          fi
+          python - <<'PY'
+          import base64, os, sys
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          blob = base64.b64decode(os.environ["COOKIES_ENC"])
+          key = bytes.fromhex(os.environ["COOKIE_KEY"].strip())
+          iv, ct = blob[:12], blob[12:]
+          try:
+              data = AESGCM(key).decrypt(iv, ct, None)
+          except Exception:
+              print("::error::cookie decryption failed - COOKIE_KEY in the extension and in the repo secret do not match")
+              sys.exit(1)
+          with open("cookies.txt", "wb") as f:
+              f.write(data)
+          PY
+
+      - name: Download item
+        env:
+          ITEM_URL: ${{ matrix.video.url }}
+          ALBUM: ${{ matrix.video.album }}
+          QUALITY: ${{ inputs.quality }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+        run: |
+          mkdir -p out
+          case "$QUALITY" in
+            audio) FMT_ARGS="-f bestaudio/best -x --audio-format mp3 --audio-quality 0" ;;
+            1080)  FMT_ARGS="-f bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b --merge-output-format mp4" ;;
+            720)   FMT_ARGS="-f bv*[height<=720]+ba/b[height<=720]/bv*+ba/b --merge-output-format mp4" ;;
+            480)   FMT_ARGS="-f bv*[height<=480]+ba/b[height<=480]/bv*+ba/b --merge-output-format mp4" ;;
+            *)     FMT_ARGS="-f bv*+ba/b --merge-output-format mp4" ;;
+          esac
+
+          COOKIE_ARGS=""
+          if [ -f cookies.txt ]; then COOKIE_ARGS="--cookies cookies.txt"; fi
+          PROXY_ARGS=""
+          if [ -n "$PROXY_URL" ]; then PROXY_ARGS="--proxy $PROXY_URL"; fi
+
+          # The channel's own playlists (album, live, singles, ...) become subfolders
+          # inside the final zip — see enumerate's "List collection items" step.
+          if [ -n "$ALBUM" ]; then
+            OUT_TEMPLATE="out/$ALBUM/%(title).100B [%(id)s].%(ext)s"
+          else
+            OUT_TEMPLATE="out/%(title).100B [%(id)s].%(ext)s"
+          fi
+
+          run_ytdlp() {
+            yt-dlp \
+              $FMT_ARGS $PROXY_ARGS "$@" \
+              --no-playlist --no-progress --newline \
+              --retries 5 --fragment-retries 10 \
+              --embed-metadata \
+              --remote-components ejs:github \
+              --ffmpeg-location "$FFMPEG_BIN" \
+              -o "$OUT_TEMPLATE" \
+              -- "$ITEM_URL"
+          }
+
+          # Same retry ladder as the single-video job (impersonate clears Cloudflare).
+          IMP="generic:impersonate"
+          ALT="youtube:player_client=default,tv,web_safari,mweb,tv_embedded"
+          if run_ytdlp $COOKIE_ARGS --extractor-args "$IMP"; then :
+          elif run_ytdlp $COOKIE_ARGS --extractor-args "$ALT"; then :
+          elif run_ytdlp $COOKIE_ARGS --impersonate chrome; then :
+          elif run_ytdlp --extractor-args "$IMP" --extractor-args "$ALT"; then :
+          else
+            echo "::error::item failed to download"
+            exit 1
+          fi
+
+      - name: Always drop cookies
+        if: always()
+        run: rm -f cookies.txt
+
+      - name: Upload item artifact
+        if: hashFiles('out/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: dl-${{ inputs.request_id }}-item-${{ matrix.video.id }}
+          path: out/
+          retention-days: 1
+          compression-level: 0
+
+  # --------------------------------------------------- collection: zip it all up
+  package:
+    if: always() && inputs.mode == 'collection' && needs.enumerate.result == 'success'
+    needs: [enumerate, download-item]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Collect item artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dl-${{ inputs.request_id }}-item-*
+          path: merged
+          merge-multiple: true
+
+      - name: Zip the collection
+        run: |
+          mkdir -p out
+          if [ -z "$(ls -A merged 2>/dev/null)" ]; then
+            echo "::error::every item in this collection failed to download"
+            exit 1
+          fi
+          (cd merged && zip -r -q "../out/${{ needs.enumerate.outputs.collection_name }}.zip" .)
+          echo "packaged $(find merged -type f | wc -l) of ${{ needs.enumerate.outputs.item_count }} items"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dl-${{ inputs.request_id }}
+          path: out/
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
